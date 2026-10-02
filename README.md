@@ -6,7 +6,7 @@ Jena is not a replacement for Windows Explorer, 7-Zip, Git, or cloud clients. Ex
 
 It is not an aggressive PC cleaner and never permanently deletes personal files automatically.
 
-The current packaged release is v0.3.2. The proposed next milestone is v0.4.0 Control Plane Core; its contract is documentation-first and implementation has not started.
+The current packaged release is v0.4.0. This release establishes the Git baseline and the Project Registry milestone of the Control Plane Core only.
 
 ## Current Capabilities
 
@@ -18,6 +18,10 @@ The current packaged release is v0.3.2. The proposed next milestone is v0.4.0 Co
 - Uses 7-Zip for project archive creation, listing, integrity testing, and staged extraction when available.
 - Creates recovery-compatible ZIP archives by default, with 7z available as a smaller option.
 - Recommends old Inactive projects for review without archiving anything automatically.
+- Discovers user-selected Project Libraries without confusing the library itself with project roots.
+- Persists project lifecycle states, including Active, Paused, Inactive, Never Archive, Archived, and Ignored.
+- Breaks project storage into source, dependencies, cache, assets, build output, and other bytes.
+- Opens projects in Windows Explorer for normal browsing.
 
 ## Current Working Flow
 

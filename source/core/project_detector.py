@@ -13,6 +13,8 @@ PROJECT_MARKERS = {
     "go.mod",
     "CMakeLists.txt",
     "composer.json",
+    "pnpm-workspace.yaml",
+    "pom.xml",
 }
 
 DEPENDENCY_DIRS = {
@@ -39,7 +41,11 @@ def is_inside_dependency_tree(path: Path) -> bool:
 
 
 def is_project_root(path: Path) -> bool:
-    return any((path / marker).exists() for marker in PROJECT_MARKERS) or bool(list(path.glob("*.sln")))
+    return (
+        any((path / marker).exists() for marker in PROJECT_MARKERS)
+        or bool(list(path.glob("*.sln")))
+        or bool(list(path.glob("*.csproj")))
+    )
 
 
 def project_type(path: Path) -> str:
@@ -56,6 +62,8 @@ def project_type(path: Path) -> str:
     if (path / "CMakeLists.txt").exists():
         return "C/C++"
     if list(path.glob("*.sln")):
+        return ".NET"
+    if list(path.glob("*.csproj")):
         return ".NET"
     if (path / ".git").exists():
         return "Git repository"

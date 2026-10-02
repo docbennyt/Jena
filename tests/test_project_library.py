@@ -7,6 +7,7 @@ import pytest
 
 from core.compression import ArchiveFormat, BuiltinZipCompressionService, find_7zip_executable
 from core.project_library import (
+    ProjectLibrary,
     ProjectState,
     archive_recommendations,
     analyze_project,
@@ -18,6 +19,7 @@ from core.project_library import (
     project_record_from_cache,
     quick_discover_project_roots,
     restore_project,
+    stable_library_id,
     set_project_state,
     verify_archive,
     verify_restored_project,
@@ -206,6 +208,31 @@ def test_quick_discovery_skips_dependency_projects_and_broad_non_projects(tmp_pa
     assert all("node_modules" not in root.parts for root in roots)
 
 
+def test_fixture_a_documents_library_does_not_become_project_and_prunes_dependencies(tmp_path: Path):
+    documents = tmp_path / "Documents"
+    (documents / "Study").mkdir(parents=True)
+    (documents / "RandomFiles").mkdir()
+    hit_asa = documents / "Projects" / "HIT-ASA"
+    (hit_asa / ".git").mkdir(parents=True)
+    (hit_asa / "src").mkdir()
+    (hit_asa / "package.json").write_text("{}")
+    for package_name in ["uuid", "react"]:
+        package = hit_asa / "node_modules" / package_name
+        package.mkdir(parents=True)
+        (package / "package.json").write_text("{}")
+
+    roots = quick_discover_project_roots(documents, max_depth=3)
+    records = discover_project_library(documents, tmp_path / "data")
+
+    assert roots == [hit_asa]
+    assert [Path(record.path) for record in records] == [hit_asa]
+    assert documents not in roots
+    assert documents / "Study" not in roots
+    assert documents / "RandomFiles" not in roots
+    assert hit_asa / "node_modules" / "uuid" not in roots
+    assert hit_asa / "node_modules" / "react" not in roots
+
+
 def test_quick_discovery_treats_monorepo_as_primary_project(tmp_path: Path):
     workspace = tmp_path / "Workspace"
     (workspace / ".git").mkdir(parents=True)
@@ -221,6 +248,46 @@ def test_quick_discovery_treats_monorepo_as_primary_project(tmp_path: Path):
     assert roots == [workspace]
 
 
+def test_fixture_c_python_virtualenv_packages_are_not_projects(tmp_path: Path):
+    project = tmp_path / "PythonProject"
+    (project / ".git").mkdir(parents=True)
+    (project / "src").mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    site_packages = project / ".venv" / "Lib" / "site-packages"
+    for index in range(20):
+        package = site_packages / f"installed_package_{index}"
+        package.mkdir(parents=True)
+        (package / "pyproject.toml").write_text("[project]\nname='dependency'\n")
+
+    roots = quick_discover_project_roots(tmp_path, max_depth=4)
+
+    assert roots == [project]
+    assert all(".venv" not in root.parts for root in roots)
+
+
+def test_large_library_streams_roots_and_prunes_dependency_directories(tmp_path: Path):
+    library = tmp_path / "LargeLibrary"
+    real_projects = []
+    for index in range(5):
+        project = library / "Area" / f"Project-{index}"
+        (project / ".git").mkdir(parents=True)
+        (project / "package.json").write_text("{}")
+        (project / "node_modules" / "dependency" / "package.json").parent.mkdir(parents=True)
+        (project / "node_modules" / "dependency" / "package.json").write_text("{}")
+        real_projects.append(project)
+    for index in range(20_000):
+        folder = library / "Documents" / f"folder-{index:05d}"
+        folder.mkdir(parents=True)
+        (folder / "note.txt").write_text("ordinary")
+
+    streamed: list[Path] = []
+    roots = quick_discover_project_roots(library, max_depth=3, on_project=streamed.append)
+
+    assert roots == real_projects
+    assert streamed == real_projects
+    assert all("node_modules" not in root.parts for root in roots)
+
+
 def test_project_analysis_cache_provides_record_without_rescan(tmp_path: Path):
     data = tmp_path / "data"
     project = make_project(tmp_path / "Projects", "Cached")
@@ -232,6 +299,53 @@ def test_project_analysis_cache_provides_record_without_rescan(tmp_path: Path):
     assert cache
     assert cached.size_bytes == analyzed.size_bytes
     assert cached.breakdown.regenerable_bytes == analyzed.breakdown.regenerable_bytes
+
+
+def test_project_registry_identity_and_lifecycle_state_survive_reload(tmp_path: Path):
+    library_root = tmp_path / "Documents" / "Projects"
+    project_a = make_project(library_root, "Project A")
+    project_b = make_project(library_root, "Project B")
+    project_c = make_project(library_root, "Project C")
+    data = tmp_path / "data"
+    library = ProjectLibrary.create(library_root, name="Primary")
+
+    assert library.library_id == stable_library_id(library_root)
+
+    set_project_state(data, project_a, ProjectState.ACTIVE, library_id=library.library_id)
+    set_project_state(data, project_b, ProjectState.PAUSED, library_id=library.library_id)
+    set_project_state(data, project_c, ProjectState.NEVER_ARCHIVE, library_id=library.library_id)
+
+    reloaded = discover_project_library(library_root, data, library_id=library.library_id)
+    states = {record.name: record.state for record in reloaded}
+
+    assert states == {
+        "Project A": ProjectState.ACTIVE,
+        "Project B": ProjectState.PAUSED,
+        "Project C": ProjectState.NEVER_ARCHIVE,
+    }
+    assert all(record.project_id for record in reloaded)
+    assert all(record.library_id == library.library_id for record in reloaded)
+    assert all(record.canonical_root_path == os.path.normcase(os.path.abspath(record.path)) for record in reloaded)
+
+
+def test_project_analysis_reports_size_buckets_git_and_activity_evidence(tmp_path: Path):
+    project = make_project(tmp_path / "Projects", "Explained")
+    write_bytes(project / "dist" / "app.bundle.js", 60, b"b")
+    data = tmp_path / "data"
+
+    record = analyze_and_cache_project(project, data)
+
+    assert record.total_size == record.size_bytes
+    assert record.source_size == record.breakdown.source_bytes
+    assert record.dependency_size == record.breakdown.dependencies_bytes
+    assert record.cache_size == record.breakdown.caches_bytes
+    assert record.asset_size == record.breakdown.assets_bytes
+    assert record.build_output_size == record.breakdown.build_output_bytes
+    assert record.other_size == record.breakdown.other_bytes
+    assert record.git_repository is True
+    assert record.last_meaningful_activity > 0
+    assert record.activity_evidence
+    assert any("source" in item.lower() for item in record.activity_evidence)
 
 
 def test_archive_recommendations_rank_only_old_inactive_projects(tmp_path: Path):

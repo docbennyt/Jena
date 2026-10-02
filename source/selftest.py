@@ -18,9 +18,12 @@ from core.project_library import (
     analyze_and_cache_project,
     archive_project,
     discover_project_library,
+    project_record_from_cache,
     quick_discover_project_roots,
     restore_project,
     set_project_state,
+    state_display,
+    stable_library_id,
     verify_archive,
     verify_restored_project,
 )
@@ -67,7 +70,7 @@ def run_self_test(output_path: Path) -> dict:
             "project_size_bytes": records[0].size_bytes if records else 0,
             "regenerable_bytes": records[0].breakdown.regenerable_bytes if records else 0,
         },
-        "persistence_after_restart": persisted[0].state.value if persisted else "missing",
+        "persistence_after_restart": state_display(persisted[0].state) if persisted else "missing",
         "recycle_bin_test": {
             "status": recycle_manifest["items"][0]["status"] if recycle_manifest["items"] else "missing",
             "sender_received": recycled,
@@ -123,7 +126,118 @@ def verify_self_test_persistence(fixture_root: Path, output_path: Path) -> dict:
             "count": len(records),
             "names": [record.name for record in records],
         },
-        "persistence_after_process_restart": records[0].state.value if records else "missing",
+        "persistence_after_process_restart": state_display(records[0].state) if records else "missing",
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def run_project_registry_test(output_path: Path, large_entries: int = 20000) -> dict:
+    root = output_path.parent / "jena-project-registry-fixture"
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    data = root / "data"
+
+    documents = _make_fixture_a(root / "FixtureA" / "Documents")
+    workspace = _make_fixture_b(root / "FixtureB" / "Workspace")
+    python_project = _make_fixture_c(root / "FixtureC" / "PythonProject")
+    large_library = root / "FixtureD" / "LargeLibrary"
+    _make_large_project_library(large_library, large_entries)
+
+    documents_library_id = stable_library_id(documents)
+    roots_a = quick_discover_project_roots(documents, max_depth=3)
+    records_a = discover_project_library(documents, data, library_id=documents_library_id)
+    roots_b = quick_discover_project_roots(workspace.parent, max_depth=4)
+    roots_c = quick_discover_project_roots(python_project.parent, max_depth=4)
+
+    set_project_state(data, roots_a[0], ProjectState.ACTIVE, library_id=documents_library_id)
+    project_b = workspace
+    set_project_state(data, project_b, ProjectState.PAUSED, library_id=stable_library_id(workspace.parent))
+    set_project_state(data, python_project, ProjectState.NEVER_ARCHIVE, library_id=stable_library_id(python_project.parent))
+
+    events: queue.Queue = queue.Queue()
+    manager = TaskManager(events, max_workers=2)
+    task = manager.submit("registry.discover", _registry_discovery_job, large_library, data)
+    streamed = 0
+    completed = None
+    started = time.time()
+    while time.time() - started < 90:
+        event: TaskEvent = events.get(timeout=10)
+        if event.kind == "progress" and event.payload.get("event") == "project_found":
+            streamed += 1
+        if event.task_id == task.id and event.state == TaskState.COMPLETED:
+            completed = event.payload
+            break
+    if completed is None:
+        raise RuntimeError("Project Registry large-library test did not complete.")
+
+    analyzed = analyze_and_cache_project(roots_a[0], data, library_id=documents_library_id)
+    state_records = [
+        project_record_from_cache(roots_a[0], data, library_id=documents_library_id),
+        project_record_from_cache(project_b, data, library_id=stable_library_id(workspace.parent)),
+        project_record_from_cache(python_project, data, library_id=stable_library_id(python_project.parent)),
+    ]
+
+    result = {
+        "fixture_a": {
+            "library": str(documents),
+            "detected": [path.name for path in roots_a],
+            "records": [record.name for record in records_a],
+            "false_projects_absent": [path.name for path in roots_a] == ["HIT-ASA"],
+        },
+        "fixture_b_monorepo": {
+            "detected": [path.name for path in roots_b],
+            "one_primary_project": [path.name for path in roots_b] == ["Workspace"],
+        },
+        "fixture_c_python": {
+            "detected": [path.name for path in roots_c],
+            "virtualenv_packages_absent": [path.name for path in roots_c] == ["PythonProject"],
+        },
+        "fixture_d_large_library": {
+            "fixture_entries": large_entries,
+            "streamed_results": streamed,
+            "discovered": completed["projects"],
+            "elapsed_seconds": round(time.time() - started, 2),
+            "bounded_discovery": completed["projects"] == ["CPPProject", "Monorepo", "NextApp", "PythonProject"],
+        },
+        "state_persistence_source": {
+            record.name: state_display(record.state)
+            for record in state_records
+        },
+        "size_breakdown": {
+            "project": analyzed.name,
+            "source_bytes": analyzed.source_size,
+            "dependency_bytes": analyzed.dependency_size,
+            "cache_bytes": analyzed.cache_size,
+            "asset_bytes": analyzed.asset_size,
+            "build_output_bytes": analyzed.build_output_size,
+            "other_bytes": analyzed.other_size,
+        },
+        "activity_reasoning": analyzed.activity_evidence,
+        "fixture_root": str(root),
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def verify_project_registry_persistence(fixture_root: Path, output_path: Path) -> dict:
+    data = fixture_root / "data"
+    documents = fixture_root / "FixtureA" / "Documents"
+    workspace = fixture_root / "FixtureB" / "Workspace"
+    python_project = fixture_root / "FixtureC" / "PythonProject"
+    records = [
+        project_record_from_cache(documents / "Projects" / "HIT-ASA", data, library_id=stable_library_id(documents)),
+        project_record_from_cache(workspace, data, library_id=stable_library_id(workspace.parent)),
+        project_record_from_cache(python_project, data, library_id=stable_library_id(python_project.parent)),
+    ]
+    result = {
+        "state_persistence_after_restart": {
+            record.name: state_display(record.state)
+            for record in records
+        }
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -185,6 +299,51 @@ def _discover_reliability_job(token, progress, library: Path, data: Path) -> dic
     for root in roots:
         analyze_and_cache_project(root, data, token=token)
     return {"projects": sorted(path.name for path in roots)}
+
+
+def _registry_discovery_job(token, progress, library: Path, data: Path) -> dict:
+    roots: list[Path] = []
+
+    def on_project(path: Path) -> None:
+        roots.append(path)
+        progress({"event": "project_found", "path": str(path), "found": len(roots)})
+
+    quick_discover_project_roots(library, max_depth=3, token=token, on_project=on_project)
+    for root in roots:
+        analyze_and_cache_project(root, data, token=token, library_id=stable_library_id(library))
+    return {"projects": sorted(path.name for path in roots)}
+
+
+def _make_fixture_a(documents: Path) -> Path:
+    (documents / "Study").mkdir(parents=True)
+    (documents / "RandomFiles").mkdir()
+    project = documents / "Projects" / "HIT-ASA"
+    (project / ".git").mkdir(parents=True)
+    _write(project / "package.json", "{}")
+    _write(project / "src" / "app.ts", "console.log('hit asa')")
+    for package in ["uuid", "react"]:
+        _write(project / "node_modules" / package / "package.json", "{}")
+    return documents
+
+
+def _make_fixture_b(workspace: Path) -> Path:
+    (workspace / ".git").mkdir(parents=True)
+    _write(workspace / "package.json", "{}")
+    _write(workspace / "pnpm-workspace.yaml", "packages: []")
+    _write(workspace / "apps" / "web" / "package.json", "{}")
+    _write(workspace / "apps" / "api" / "package.json", "{}")
+    _write(workspace / "packages" / "shared" / "package.json", "{}")
+    _write(workspace / "node_modules" / "react" / "package.json", "{}")
+    return workspace
+
+
+def _make_fixture_c(project: Path) -> Path:
+    (project / ".git").mkdir(parents=True)
+    _write(project / "pyproject.toml", "[project]\nname='fixture'")
+    _write(project / "src" / "app.py", "print('fixture')")
+    for index in range(100):
+        _write(project / ".venv" / "Lib" / "site-packages" / f"pkg_{index}" / "pyproject.toml", "[project]\nname='dependency'")
+    return project
 
 
 def _make_large_project_library(library: Path, entries: int) -> None:

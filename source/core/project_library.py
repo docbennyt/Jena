@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -16,19 +17,41 @@ from .tasks import CancellationToken, TaskCancelled
 
 
 class ProjectState(str, Enum):
-    ACTIVE = "Active"
-    INACTIVE = "Inactive"
-    NEVER_ARCHIVE = "Never Archive"
-    ARCHIVED = "Archived"
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    INACTIVE = "INACTIVE"
+    ARCHIVED = "ARCHIVED"
+    NEVER_ARCHIVE = "NEVER_ARCHIVE"
+    IGNORED = "IGNORED"
 
 
 DEPENDENCY_DIRS = {"node_modules", "vendor", ".venv", "venv", "env", "site-packages"}
-CACHE_DIRS = {".next", "dist", "build", "coverage", "__pycache__", ".pytest_cache", ".mypy_cache"}
-IGNORED_SCAN_DIRS = DEPENDENCY_DIRS | CACHE_DIRS | {".git", ".cache"}
+CACHE_DIRS = {".next", "coverage", "__pycache__", ".pytest_cache", ".mypy_cache"}
+BUILD_OUTPUT_DIRS = {"dist", "build"}
+IGNORED_SCAN_DIRS = DEPENDENCY_DIRS | CACHE_DIRS | BUILD_OUTPUT_DIRS | {".git", ".cache"}
 ASSET_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".psd", ".ai", ".fig", ".mp4", ".mov", ".mkv",
     ".wav", ".mp3", ".pdf", ".pptx", ".docx", ".xlsx",
 }
+PROJECT_MARKERS = {
+    ".git",
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "Pipfile",
+    "Cargo.toml",
+    "go.mod",
+    "CMakeLists.txt",
+    "composer.json",
+    "pnpm-workspace.yaml",
+    "package-lock.json",
+    "yarn.lock",
+    "Cargo.lock",
+    "pom.xml",
+    "*.sln",
+    "*.csproj",
+}
+PROJECT_ACTIVITY_MARKERS = {marker for marker in PROJECT_MARKERS if "*" not in marker}
 
 
 @dataclass
@@ -37,15 +60,41 @@ class ProjectBreakdown:
     dependencies_bytes: int = 0
     caches_bytes: int = 0
     assets_bytes: int = 0
+    build_output_bytes: int = 0
     other_bytes: int = 0
 
     @property
     def total_bytes(self) -> int:
-        return self.source_bytes + self.dependencies_bytes + self.caches_bytes + self.assets_bytes + self.other_bytes
+        return (
+            self.source_bytes
+            + self.dependencies_bytes
+            + self.caches_bytes
+            + self.assets_bytes
+            + self.build_output_bytes
+            + self.other_bytes
+        )
 
     @property
     def regenerable_bytes(self) -> int:
         return self.dependencies_bytes + self.caches_bytes
+
+
+@dataclass(frozen=True)
+class ProjectLibrary:
+    library_id: str
+    root_path: str
+    display_name: str
+    created_at: float
+
+    @classmethod
+    def create(cls, root_path: Path, name: str | None = None) -> "ProjectLibrary":
+        root = root_path.expanduser().resolve()
+        return cls(
+            library_id=stable_library_id(root),
+            root_path=str(root),
+            display_name=name or root.name or str(root),
+            created_at=time.time(),
+        )
 
 
 @dataclass
@@ -58,6 +107,49 @@ class ProjectRecord:
     state: ProjectState
     breakdown: ProjectBreakdown
     archive_manifest: str | None = None
+    project_id: str = ""
+    library_id: str = ""
+    canonical_root_path: str = ""
+    display_name: str = ""
+    detected_markers: list[str] | None = None
+    git_repository: bool = False
+    git_remote: str | None = None
+    git_branch: str | None = None
+    git_commit: str | None = None
+    git_dirty: bool = False
+    pinned: bool = False
+    never_archive: bool = False
+    last_meaningful_activity: float = 0
+    activity_evidence: list[str] | None = None
+    analysis_timestamp: float = 0
+
+    @property
+    def total_size(self) -> int:
+        return self.size_bytes
+
+    @property
+    def source_size(self) -> int:
+        return self.breakdown.source_bytes
+
+    @property
+    def dependency_size(self) -> int:
+        return self.breakdown.dependencies_bytes
+
+    @property
+    def cache_size(self) -> int:
+        return self.breakdown.caches_bytes
+
+    @property
+    def asset_size(self) -> int:
+        return self.breakdown.assets_bytes
+
+    @property
+    def build_output_size(self) -> int:
+        return self.breakdown.build_output_bytes
+
+    @property
+    def other_size(self) -> int:
+        return self.breakdown.other_bytes
 
 
 @dataclass
@@ -126,18 +218,22 @@ def load_project_states(data_root: Path) -> dict[str, dict]:
     path = project_state_path(data_root)
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if "project_states" in payload:
+        return payload.get("project_states", {})
+    return payload
 
 
 def save_project_states(data_root: Path, states: dict[str, dict]) -> None:
     data_root.mkdir(parents=True, exist_ok=True)
-    project_state_path(data_root).write_text(json.dumps(states, indent=2), encoding="utf-8")
+    payload = {"schema": "jena.project-registry.v1", "project_states": states}
+    project_state_path(data_root).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def archived_project_records(data_root: Path) -> list[ProjectRecord]:
     records: list[ProjectRecord] = []
     for original_path, state_entry in load_project_states(data_root).items():
-        if state_entry.get("state") != ProjectState.ARCHIVED.value:
+        if _project_state(state_entry.get("state", ProjectState.ACTIVE.value)) != ProjectState.ARCHIVED:
             continue
         manifest_value = state_entry.get("archive_manifest")
         if not manifest_value:
@@ -151,8 +247,7 @@ def archived_project_records(data_root: Path) -> list[ProjectRecord]:
         if not included_bytes:
             included_bytes = sum(int(item.get("size", 0)) for item in manifest.get("files", []))
         excluded_bytes = int(manifest.get("excluded_bytes", 0))
-        records.append(
-            ProjectRecord(
+        record = ProjectRecord(
                 name=str(manifest.get("project_name") or Path(original_path).name),
                 path=str(manifest.get("project_path") or original_path),
                 project_type=str(manifest.get("project_type") or "Archived project"),
@@ -162,15 +257,25 @@ def archived_project_records(data_root: Path) -> list[ProjectRecord]:
                 breakdown=ProjectBreakdown(dependencies_bytes=excluded_bytes, other_bytes=included_bytes),
                 archive_manifest=str(manifest_path),
             )
-        )
+        records.append(finalize_project_record(record, state_entry))
     return sorted(records, key=lambda item: item.size_bytes, reverse=True)
 
 
-def set_project_state(data_root: Path, project_path: Path, state: ProjectState, archive_manifest: Path | None = None) -> None:
+def set_project_state(
+    data_root: Path,
+    project_path: Path,
+    state: ProjectState,
+    archive_manifest: Path | None = None,
+    library_id: str = "",
+) -> None:
     states = load_project_states(data_root)
     key = _canonical(project_path)
     entry = states.get(key, {})
     entry["state"] = state.value
+    if library_id:
+        entry["library_id"] = library_id
+    entry["pinned"] = state in {ProjectState.ACTIVE, ProjectState.PAUSED, ProjectState.NEVER_ARCHIVE}
+    entry["never_archive"] = state == ProjectState.NEVER_ARCHIVE
     if archive_manifest is not None:
         entry["archive_manifest"] = str(archive_manifest)
     states[key] = entry
@@ -189,8 +294,9 @@ def save_project_cache(data_root: Path, cache: dict[str, dict]) -> None:
     project_cache_path(data_root).write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
-def discover_project_library(library_root: Path, data_root: Path | None = None) -> list[ProjectRecord]:
+def discover_project_library(library_root: Path, data_root: Path | None = None, library_id: str = "") -> list[ProjectRecord]:
     library_root = library_root.expanduser().resolve()
+    library_id = library_id or stable_library_id(library_root)
     states = load_project_states(data_root) if data_root else {}
     projects: list[ProjectRecord] = []
     for current, dirs, _files in os.walk(library_root, topdown=True, followlinks=False):
@@ -199,7 +305,7 @@ def discover_project_library(library_root: Path, data_root: Path | None = None) 
             dirs[:] = []
             continue
         if is_project_root(current_path):
-            projects.append(build_project_record(current_path, states.get(_canonical(current_path), {})))
+            projects.append(build_project_record(current_path, states.get(_canonical(current_path), {}), library_id=library_id))
             dirs[:] = [name for name in dirs if name not in IGNORED_SCAN_DIRS]
             continue
         dirs[:] = [name for name in dirs if name not in IGNORED_SCAN_DIRS]
@@ -245,7 +351,8 @@ def quick_discover_project_roots(
     return found
 
 
-def project_record_from_cache(project_path: Path, data_root: Path) -> ProjectRecord:
+def project_record_from_cache(project_path: Path, data_root: Path, library_id: str = "") -> ProjectRecord:
+    project_path = project_path.expanduser().resolve()
     states = load_project_states(data_root)
     cache = load_project_cache(data_root)
     key = _canonical(project_path)
@@ -253,33 +360,74 @@ def project_record_from_cache(project_path: Path, data_root: Path) -> ProjectRec
     state_entry = states.get(key, {})
     breakdown_payload = entry.get("breakdown") or {}
     breakdown = ProjectBreakdown(**{field: int(breakdown_payload.get(field, 0)) for field in ProjectBreakdown.__dataclass_fields__})
-    state_value = state_entry.get("state", ProjectState.ACTIVE.value)
-    return ProjectRecord(
+    state = _project_state(state_entry.get("state", ProjectState.ACTIVE.value))
+    markers = entry.get("detected_markers") or detected_markers(project_path)
+    git_info = entry.get("git") or git_state(project_path)
+    library_id = library_id or state_entry.get("library_id") or entry.get("library_id") or stable_library_id(project_path.parent)
+    record = ProjectRecord(
         name=project_path.name,
         path=str(project_path),
         project_type=project_type(project_path),
         size_bytes=int(entry.get("size_bytes", breakdown.total_bytes)),
         modified_at=float(entry.get("modified_at", project_path.stat().st_mtime if project_path.exists() else 0)),
-        state=ProjectState(state_value),
+        state=state,
         breakdown=breakdown,
         archive_manifest=state_entry.get("archive_manifest"),
+        library_id=library_id,
+        detected_markers=markers,
+        git_remote=git_info.get("remote"),
+        git_branch=git_info.get("branch"),
+        git_commit=git_info.get("commit"),
+        git_dirty=bool(git_info.get("dirty")),
+        last_meaningful_activity=float(entry.get("last_meaningful_activity", 0)),
+        activity_evidence=entry.get("activity_evidence") or [],
+        analysis_timestamp=float(entry.get("analysis_timestamp", entry.get("last_scan_time", 0))),
     )
+    return finalize_project_record(record, state_entry)
 
 
-def analyze_and_cache_project(project_path: Path, data_root: Path, token: CancellationToken | None = None, progress=None) -> ProjectRecord:
-    breakdown, modified_at = analyze_project(project_path, token=token, progress=progress)
+def analyze_and_cache_project(
+    project_path: Path,
+    data_root: Path,
+    token: CancellationToken | None = None,
+    progress=None,
+    library_id: str = "",
+) -> ProjectRecord:
+    project_path = project_path.expanduser().resolve()
+    breakdown, modified_at, last_meaningful_activity, evidence = analyze_project_activity(project_path, token=token, progress=progress)
+    markers = detected_markers(project_path)
+    git_info = git_state(project_path)
+    library_id = library_id or stable_library_id(project_path.parent)
     cache = load_project_cache(data_root)
     key = _canonical(project_path)
     cache[key] = {
         "project_root": str(project_path),
+        "project_id": stable_project_id(library_id, project_path),
+        "library_id": library_id,
         "last_scan_time": time.time(),
         "size_bytes": breakdown.total_bytes,
         "modified_at": modified_at,
+        "last_meaningful_activity": last_meaningful_activity,
+        "activity_evidence": evidence,
+        "detected_markers": markers,
+        "git": git_info,
+        "analysis_timestamp": time.time(),
         "breakdown": asdict(breakdown),
     }
     save_project_cache(data_root, cache)
     states = load_project_states(data_root)
-    return build_project_record(project_path, states.get(key, {}), breakdown=breakdown, modified_at=modified_at)
+    return build_project_record(
+        project_path,
+        states.get(key, {}),
+        breakdown=breakdown,
+        modified_at=modified_at,
+        library_id=library_id,
+        last_meaningful_activity=last_meaningful_activity,
+        activity_evidence=evidence,
+        detected=markers,
+        git_info=git_info,
+        analysis_timestamp=cache[key]["analysis_timestamp"],
+    )
 
 
 def build_project_record(
@@ -287,26 +435,55 @@ def build_project_record(
     state_entry: dict | None = None,
     breakdown: ProjectBreakdown | None = None,
     modified_at: float | None = None,
+    library_id: str = "",
+    last_meaningful_activity: float | None = None,
+    activity_evidence: list[str] | None = None,
+    detected: list[str] | None = None,
+    git_info: dict | None = None,
+    analysis_timestamp: float = 0,
 ) -> ProjectRecord:
+    project_path = project_path.expanduser().resolve()
     state_entry = state_entry or {}
     if breakdown is None or modified_at is None:
         breakdown, modified_at = analyze_project(project_path)
-    state_value = state_entry.get("state", ProjectState.ACTIVE.value)
-    return ProjectRecord(
+    library_id = library_id or state_entry.get("library_id") or stable_library_id(project_path.parent)
+    git_info = git_info or git_state(project_path)
+    record = ProjectRecord(
         name=project_path.name,
         path=str(project_path),
         project_type=project_type(project_path),
         size_bytes=breakdown.total_bytes,
         modified_at=modified_at,
-        state=ProjectState(state_value),
+        state=_project_state(state_entry.get("state", ProjectState.ACTIVE.value)),
         breakdown=breakdown,
         archive_manifest=state_entry.get("archive_manifest"),
+        library_id=library_id,
+        detected_markers=detected or detected_markers(project_path),
+        git_remote=git_info.get("remote"),
+        git_branch=git_info.get("branch"),
+        git_commit=git_info.get("commit"),
+        git_dirty=bool(git_info.get("dirty")),
+        last_meaningful_activity=last_meaningful_activity if last_meaningful_activity is not None else modified_at,
+        activity_evidence=activity_evidence or [f"Latest meaningful project file change: {_format_age_time(modified_at)}."],
+        analysis_timestamp=analysis_timestamp,
     )
+    return finalize_project_record(record, state_entry)
 
 
 def analyze_project(project_path: Path, token: CancellationToken | None = None, progress=None) -> tuple[ProjectBreakdown, float]:
+    breakdown, modified_at, _activity, _evidence = analyze_project_activity(project_path, token=token, progress=progress)
+    return breakdown, modified_at
+
+
+def analyze_project_activity(
+    project_path: Path,
+    token: CancellationToken | None = None,
+    progress=None,
+) -> tuple[ProjectBreakdown, float, float, list[str]]:
     breakdown = ProjectBreakdown()
     latest = project_path.stat().st_mtime if project_path.exists() else 0
+    source_latest = 0.0
+    marker_latest = 0.0
     scanned = 0
     for current, dirs, files in os.walk(project_path, topdown=True, followlinks=False):
         if token and token.cancelled:
@@ -320,28 +497,26 @@ def analyze_project(project_path: Path, token: CancellationToken | None = None, 
             except OSError:
                 continue
             latest = max(latest, stat.st_mtime)
-            _add_to_bucket(breakdown, bucket if bucket else _file_bucket(path), stat.st_size)
+            file_bucket = bucket if bucket else _file_bucket(path)
+            _add_to_bucket(breakdown, file_bucket, stat.st_size)
+            if file_bucket == "source":
+                source_latest = max(source_latest, stat.st_mtime)
+            if file_name in PROJECT_ACTIVITY_MARKERS:
+                marker_latest = max(marker_latest, stat.st_mtime)
             scanned += 1
             if progress and scanned % 250 == 0:
                 progress({"project": str(project_path), "current": str(current_path), "bytes": breakdown.total_bytes, "files": scanned})
         dirs[:] = list(dirs)
-    return breakdown, latest
+    git_info = git_state(project_path)
+    git_commit_time = float(git_info.get("commit_time") or 0)
+    last_meaningful = max(source_latest, marker_latest, git_commit_time, latest if git_info.get("dirty") else 0)
+    evidence = activity_evidence(source_latest, marker_latest, git_commit_time, bool(git_info.get("dirty")), last_meaningful)
+    return breakdown, latest, last_meaningful, evidence
 
 
 def _entry_names_indicate_project(entry_names: set[str], path: Path) -> bool:
-    marker_names = {
-        ".git",
-        "package.json",
-        "pyproject.toml",
-        "requirements.txt",
-        "Pipfile",
-        "Cargo.toml",
-        "go.mod",
-        "CMakeLists.txt",
-        "composer.json",
-        "pnpm-workspace.yaml",
-    }
-    return bool(entry_names & marker_names) or any(child.suffix == ".sln" for child in path.glob("*.sln"))
+    marker_names = {marker for marker in PROJECT_MARKERS if "*" not in marker}
+    return bool(entry_names & marker_names) or any(any(path.glob(pattern)) for pattern in ("*.sln", "*.csproj"))
 
 
 def archive_project(
@@ -579,6 +754,8 @@ def _bucket_for(path: Path, project_path: Path) -> str | None:
         return "dependencies"
     if any(part in CACHE_DIRS for part in rel_parts):
         return "caches"
+    if any(part in BUILD_OUTPUT_DIRS for part in rel_parts):
+        return "build_output"
     return None
 
 
@@ -597,6 +774,8 @@ def _add_to_bucket(breakdown: ProjectBreakdown, bucket: str, size: int) -> None:
         breakdown.caches_bytes += size
     elif bucket == "assets":
         breakdown.assets_bytes += size
+    elif bucket == "build_output":
+        breakdown.build_output_bytes += size
     elif bucket == "source":
         breakdown.source_bytes += size
     else:
@@ -617,6 +796,156 @@ def _unique_path(path: Path) -> Path:
 
 def _canonical(path: Path) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
+
+
+def stable_library_id(root_path: Path) -> str:
+    return "lib_" + hashlib.sha256(_canonical(root_path.expanduser().resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def stable_project_id(library_id: str, project_path: Path) -> str:
+    identity = f"{library_id}:{_canonical(project_path.expanduser().resolve())}"
+    return "proj_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+
+def finalize_project_record(record: ProjectRecord, state_entry: dict | None = None) -> ProjectRecord:
+    state_entry = state_entry or {}
+    path = Path(record.path)
+    record.canonical_root_path = _canonical(path)
+    record.display_name = record.display_name or record.name
+    record.project_id = record.project_id or stable_project_id(record.library_id, path)
+    record.git_repository = bool(record.git_repository or (path / ".git").exists() or record.git_commit or record.git_remote)
+    record.pinned = bool(state_entry.get("pinned", record.state in {ProjectState.ACTIVE, ProjectState.PAUSED, ProjectState.NEVER_ARCHIVE}))
+    record.never_archive = bool(state_entry.get("never_archive", record.state == ProjectState.NEVER_ARCHIVE))
+    if record.state == ProjectState.NEVER_ARCHIVE:
+        record.never_archive = True
+        record.pinned = True
+    if record.activity_evidence is None:
+        record.activity_evidence = []
+    if record.detected_markers is None:
+        record.detected_markers = []
+    return record
+
+
+def detected_markers(project_path: Path) -> list[str]:
+    markers: list[str] = []
+    for marker in sorted(PROJECT_MARKERS):
+        if "*" in marker:
+            if list(project_path.glob(marker)):
+                markers.append(marker)
+        elif (project_path / marker).exists():
+            markers.append(marker)
+    return markers
+
+
+def git_state(project_path: Path) -> dict:
+    if not (project_path / ".git").exists():
+        return {"repository": False}
+    top_level = _git_output(project_path, ["rev-parse", "--show-toplevel"])
+    if not top_level:
+        return {"repository": True}
+    if _canonical(Path(top_level)) != _canonical(project_path):
+        return {"repository": True}
+    return {
+        "repository": True,
+        "remote": _git_output(project_path, ["config", "--get", "remote.origin.url"]),
+        "branch": _git_output(project_path, ["rev-parse", "--abbrev-ref", "HEAD"]),
+        "commit": _git_output(project_path, ["rev-parse", "HEAD"]),
+        "commit_time": _git_timestamp(project_path),
+        "dirty": bool(_git_output(project_path, ["status", "--porcelain"])),
+    }
+
+
+def activity_evidence(
+    source_latest: float,
+    marker_latest: float,
+    git_commit_time: float,
+    git_dirty: bool,
+    last_meaningful: float,
+) -> list[str]:
+    evidence: list[str] = []
+    if source_latest:
+        evidence.append(f"Recent source change: {_format_age_time(source_latest)}.")
+    if marker_latest:
+        evidence.append(f"Recent project-file change: {_format_age_time(marker_latest)}.")
+    if git_commit_time:
+        evidence.append(f"Last Git commit: {_format_age_time(git_commit_time)}.")
+    if git_dirty:
+        evidence.append("Git working tree has uncommitted changes.")
+    if not evidence and last_meaningful:
+        evidence.append(f"Latest meaningful project activity: {_format_age_time(last_meaningful)}.")
+    return evidence
+
+
+def _git_output(project_path: Path, args: list[str]) -> str | None:
+    startupinfo = None
+    creationflags = 0
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        creationflags = subprocess.CREATE_NO_WINDOW
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=3,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.strip()
+    return value or None
+
+
+def _git_timestamp(project_path: Path) -> float:
+    value = _git_output(project_path, ["log", "-1", "--format=%ct"])
+    if not value:
+        return 0
+    try:
+        return float(value)
+    except ValueError:
+        return 0
+
+
+def _project_state(value: str | ProjectState) -> ProjectState:
+    if isinstance(value, ProjectState):
+        return value
+    aliases = {
+        "Active": ProjectState.ACTIVE,
+        "Paused": ProjectState.PAUSED,
+        "Inactive": ProjectState.INACTIVE,
+        "Archived": ProjectState.ARCHIVED,
+        "Never Archive": ProjectState.NEVER_ARCHIVE,
+        "Ignored": ProjectState.IGNORED,
+    }
+    if value in aliases:
+        return aliases[value]
+    return ProjectState(value)
+
+
+def state_display(state: ProjectState) -> str:
+    return {
+        ProjectState.ACTIVE: "Active",
+        ProjectState.PAUSED: "Paused",
+        ProjectState.INACTIVE: "Inactive",
+        ProjectState.ARCHIVED: "Archived",
+        ProjectState.NEVER_ARCHIVE: "Never Archive",
+        ProjectState.IGNORED: "Ignored",
+    }[state]
+
+
+def _format_age_time(timestamp: float) -> str:
+    days = max(0, int((time.time() - timestamp) // 86400))
+    if days == 0:
+        return "today"
+    if days == 1:
+        return "1 day ago"
+    return f"{days} days ago"
 
 
 def record_to_json(record: ProjectRecord) -> dict:

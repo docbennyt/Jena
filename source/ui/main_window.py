@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - fallback for development without depen
 
 from core.models import Finding, RiskLevel
 from core.compression import ArchiveFormat, find_7zip_executable
+from core.explorer import open_in_explorer
 from core.file_actions import build_delete_plan, permanently_delete_paths, recycle_paths
 from core.operations import recycle_findings, restore_from_manifest
 from core.project_library import (
@@ -29,6 +30,8 @@ from core.project_library import (
     quick_discover_project_roots,
     restore_project,
     set_project_state,
+    stable_library_id,
+    state_display,
 )
 from core.preview import PreviewService
 from core.scanner import ScanOptions, Scanner
@@ -345,10 +348,12 @@ class StoragePilotApp:
         controls.pack(fill="x", padx=12, pady=(0, 8))
         for label, state in [
             ("Mark Active", ProjectState.ACTIVE),
+            ("Mark Paused", ProjectState.PAUSED),
             ("Mark Inactive", ProjectState.INACTIVE),
             ("Never Archive", ProjectState.NEVER_ARCHIVE),
         ]:
             self._button(controls, label, lambda s=state: self.set_selected_project_state(s)).pack(side="left", padx=4)
+        self._button(controls, "Open in Explorer", self.open_selected_project_in_explorer).pack(side="left", padx=14)
         self._button(controls, "Archive", self.archive_selected_project).pack(side="left", padx=14)
         self._button(controls, "Restore", self.restore_selected_project_archive).pack(side="left", padx=4)
         self._button(controls, "Archive Candidates", self.show_archive_candidates).pack(side="left", padx=4)
@@ -917,16 +922,17 @@ class StoragePilotApp:
             self.insert_or_update_project(record)
         self.project_detail_var.set("Discovering projects...")
         self.project_notice_var.set(self.project_library_notice(Path(root)))
-        task = self.task_manager.submit("projects.discover", self._project_discovery_job, Path(root), data_dir())
+        library_id = stable_library_id(Path(root))
+        task = self.task_manager.submit("projects.discover", self._project_discovery_job, Path(root), data_dir(), library_id)
         self.project_tasks.add(task.id)
         self.status.set("Discovering projects · 0 found")
 
-    def _project_discovery_job(self, token, progress, root: Path, data_root: Path) -> list[str]:
+    def _project_discovery_job(self, token, progress, root: Path, data_root: Path, library_id: str) -> list[str]:
         found: list[str] = []
 
         def on_project(project_path: Path) -> None:
             found.append(str(project_path))
-            progress({"event": "project_found", "path": str(project_path), "found": len(found)})
+            progress({"event": "project_found", "path": str(project_path), "found": len(found), "library_id": library_id})
 
         def on_progress(payload: dict) -> None:
             payload["event"] = "discovering"
@@ -935,8 +941,8 @@ class StoragePilotApp:
         quick_discover_project_roots(root, max_depth=3, token=token, on_project=on_project, on_progress=on_progress)
         return found
 
-    def _project_analysis_job(self, token, progress, project_path: Path, data_root: Path) -> dict:
-        record = analyze_and_cache_project(project_path, data_root, token=token, progress=progress)
+    def _project_analysis_job(self, token, progress, project_path: Path, data_root: Path, library_id: str) -> dict:
+        record = analyze_and_cache_project(project_path, data_root, token=token, progress=progress, library_id=library_id)
         return {
             "path": record.path,
             "name": record.name,
@@ -949,14 +955,15 @@ class StoragePilotApp:
             payload = event.payload or {}
             if payload.get("event") == "project_found":
                 project_path = Path(payload["path"])
-                record = project_record_from_cache(project_path, data_dir())
+                library_id = payload.get("library_id") or stable_library_id(project_path.parent)
+                record = project_record_from_cache(project_path, data_dir(), library_id=library_id)
                 existing = next((index for index, item in enumerate(self.project_records) if item.path == record.path), None)
                 if existing is None:
                     self.project_records.append(record)
                 else:
                     self.project_records[existing] = record
                 self.insert_or_update_project(record)
-                analysis = self.task_manager.submit("projects.analyze", self._project_analysis_job, project_path, data_dir())
+                analysis = self.task_manager.submit("projects.analyze", self._project_analysis_job, project_path, data_dir(), library_id)
                 self.project_tasks.add(analysis.id)
                 self.status.set(f"Discovering projects · {payload.get('found', len(self.project_records))} found")
             elif "project" in payload:
@@ -968,7 +975,7 @@ class StoragePilotApp:
             payload = event.payload or {}
             for index, record in enumerate(self.project_records):
                 if record.path == payload.get("path"):
-                    self.project_records[index] = project_record_from_cache(Path(record.path), data_dir())
+                    self.project_records[index] = project_record_from_cache(Path(record.path), data_dir(), library_id=record.library_id)
                     self.insert_or_update_project(self.project_records[index])
                     break
             self.status.set(f"Analyzed {payload.get('name', 'project')}")
@@ -1000,7 +1007,7 @@ class StoragePilotApp:
         candidate = f"{recommendations[0].days_inactive} days" if recommendations else ""
         values = (
             project.name,
-            project.state.value,
+            state_display(project.state),
             size,
             regenerable,
             format_date(project.modified_at),
@@ -1042,6 +1049,9 @@ class StoragePilotApp:
         )
 
     def project_iid(self, path: str) -> str:
+        record = next((item for item in self.project_records if item.path == path), None)
+        if record and record.project_id:
+            return record.project_id
         return str(abs(hash(path)))
 
     def project_library_notice(self, root: Path) -> str:
@@ -1070,9 +1080,12 @@ class StoragePilotApp:
         if not project:
             return
         b = project.breakdown
+        evidence = " ".join(project.activity_evidence or [])
         self.project_detail_var.set(
             f"{project.name}: Source {format_bytes(b.source_bytes)} · Dependencies {format_bytes(b.dependencies_bytes)} · "
-            f"Caches {format_bytes(b.caches_bytes)} · Assets {format_bytes(b.assets_bytes)} · Other {format_bytes(b.other_bytes)}"
+            f"Caches {format_bytes(b.caches_bytes)} · Assets {format_bytes(b.assets_bytes)} · "
+            f"Build output {format_bytes(b.build_output_bytes)} · Other {format_bytes(b.other_bytes)} · "
+            f"Last meaningful activity {format_date(project.last_meaningful_activity or project.modified_at)}. {evidence}"
         )
 
     def save_archive_format(self) -> None:
@@ -1085,13 +1098,23 @@ class StoragePilotApp:
         if not project:
             show_info(self.root, "No project selected", "Select a project first.")
             return
-        set_project_state(data_dir(), Path(project.path), state)
+        set_project_state(data_dir(), Path(project.path), state, library_id=project.library_id)
         for index, record in enumerate(self.project_records):
             if record.path == project.path:
                 record.state = state
                 self.project_records[index] = record
                 self.insert_or_update_project(record)
                 break
+
+    def open_selected_project_in_explorer(self) -> None:
+        project = self.selected_project()
+        if not project:
+            show_info(self.root, "No project selected", "Select a project first.")
+            return
+        try:
+            open_in_explorer(Path(project.path))
+        except OSError as exc:
+            show_error(self.root, "Open in Explorer failed", str(exc))
 
     def archive_selected_project(self) -> None:
         project = self.selected_project()

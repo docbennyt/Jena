@@ -54,6 +54,25 @@ class Database:
                 payload text not null,
                 manifest_path text
             );
+            create table if not exists project_libraries (
+                library_id text primary key,
+                root_path text not null,
+                display_name text not null,
+                created_at real not null,
+                updated_at real not null
+            );
+            create table if not exists project_registry (
+                project_id text primary key,
+                library_id text not null,
+                canonical_root_path text not null,
+                display_name text not null,
+                lifecycle_state text not null,
+                pinned integer not null default 0,
+                never_archive integer not null default 0,
+                payload text not null,
+                analysis_timestamp real not null,
+                unique(library_id, canonical_root_path)
+            );
             """
         )
         self.connection.commit()

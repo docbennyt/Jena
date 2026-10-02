@@ -56,3 +56,17 @@ def test_settings_persist_target_free_space(tmp_path: Path):
     reloaded = Settings(settings_path)
 
     assert reloaded.get("target_free_gb") == 32
+
+
+def test_database_migrates_project_registry_tables(tmp_path: Path):
+    db = Database(tmp_path / "storagepilot.db")
+
+    tables = {
+        row[0]
+        for row in db.connection.execute(
+            "select name from sqlite_master where type = 'table' and name in ('project_libraries', 'project_registry')"
+        ).fetchall()
+    }
+
+    assert tables == {"project_libraries", "project_registry"}
+    db.close()

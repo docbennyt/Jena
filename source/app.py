@@ -7,7 +7,14 @@ import traceback
 
 from core.compression import ArchiveFormat
 from core.project_library import archive_project
-from selftest import _make_large_project_library, run_reliability_test, run_self_test, verify_self_test_persistence
+from selftest import (
+    _make_large_project_library,
+    run_project_registry_test,
+    run_reliability_test,
+    run_self_test,
+    verify_project_registry_persistence,
+    verify_self_test_persistence,
+)
 from ui.main_window import StoragePilotApp
 
 
@@ -15,8 +22,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", type=Path, help="Run disposable v0.3.0 integration fixture and write JSON evidence.")
     parser.add_argument("--reliability-test", type=Path, help="Run disposable v0.3.1 reliability fixture and write JSON evidence.")
+    parser.add_argument("--project-registry-test", type=Path, help="Run disposable v0.4.0 Project Registry fixture and write JSON evidence.")
     parser.add_argument("--ui-responsiveness-test", type=Path, help="Run a disposable Tk responsiveness check and write JSON evidence.")
     parser.add_argument("--verify-persistence", nargs=2, metavar=("FIXTURE_ROOT", "OUTPUT_JSON"), help="Verify an existing self-test fixture from a separate process.")
+    parser.add_argument("--verify-project-registry-persistence", nargs=2, metavar=("FIXTURE_ROOT", "OUTPUT_JSON"), help="Verify Project Registry state from a separate process.")
     args = parser.parse_args()
     if args.self_test:
         _write_cli_result(args.self_test, lambda: run_self_test(args.self_test))
@@ -24,12 +33,19 @@ def main() -> None:
     if args.reliability_test:
         _write_cli_result(args.reliability_test, lambda: run_reliability_test(args.reliability_test))
         return
+    if args.project_registry_test:
+        _write_cli_result(args.project_registry_test, lambda: run_project_registry_test(args.project_registry_test))
+        return
     if args.ui_responsiveness_test:
         run_ui_responsiveness_test(args.ui_responsiveness_test)
         return
     if args.verify_persistence:
         output = Path(args.verify_persistence[1])
         _write_cli_result(output, lambda: verify_self_test_persistence(Path(args.verify_persistence[0]), output))
+        return
+    if args.verify_project_registry_persistence:
+        output = Path(args.verify_project_registry_persistence[1])
+        _write_cli_result(output, lambda: verify_project_registry_persistence(Path(args.verify_project_registry_persistence[0]), output))
         return
     StoragePilotApp().run()
 

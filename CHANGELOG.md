@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0 - 2026-10-02
+
+### Added
+- Established Git repository hygiene and pushed the accepted v0.3.2 plus control-plane documentation baseline.
+- Added stable Project Library and Project Registry identity fields so a library root is not treated as a project root.
+- Added lifecycle states `ACTIVE`, `PAUSED`, `INACTIVE`, `ARCHIVED`, `NEVER_ARCHIVE`, and `IGNORED`, with legacy state migration.
+- Added cached project analysis fields for source, dependencies, cache, assets, build output, and other bytes.
+- Added explainable meaningful activity evidence using source changes, project-file changes, Git commit state, and dirty working tree state.
+- Added Explorer delegation for opening selected projects from Jena.
+
+### Fixed
+- Prevented broad folders such as Documents from becoming projects just because descendants contain project markers.
+- Prevented dependency and virtual environment packages from entering project discovery.
+- Preserved monorepo workspace boundaries as one primary project by default.
+
 ## 0.3.2 - 2026-10-02
 
 ### Added
