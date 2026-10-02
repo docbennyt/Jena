@@ -111,6 +111,12 @@ Every recommendation must expose:
 
 If a feature is not reliably working in the packaged application, it is not complete. Source tests alone do not satisfy the release bar.
 
+## Rule 11 - Real Workflow Beats Synthetic Success
+
+Fixtures prove deterministic invariants. Packaged-app testing proves integration. When a feature operates over user-selected real-world structures, at least one safe, non-destructive acceptance test should use the actual shape of the user's environment where practical.
+
+Never perform destructive tests on real data. Project discovery can be tested against real project libraries because it only reads filesystem structure. Delete, recycle, archive, restore, and cleanup workflows must use disposable fixtures or copies.
+
 ## Product Value Test
 
 Before implementing any substantial feature, answer these questions in its issue, design note, or ADR:

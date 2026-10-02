@@ -9,9 +9,12 @@ from core.compression import ArchiveFormat
 from core.project_library import archive_project
 from selftest import (
     _make_large_project_library,
+    run_real_project_registry_smoke,
+    run_real_storage_smoke,
     run_project_registry_test,
     run_reliability_test,
     run_self_test,
+    run_storage_intelligence_test,
     verify_project_registry_persistence,
     verify_self_test_persistence,
 )
@@ -23,6 +26,9 @@ def main() -> None:
     parser.add_argument("--self-test", type=Path, help="Run disposable v0.3.0 integration fixture and write JSON evidence.")
     parser.add_argument("--reliability-test", type=Path, help="Run disposable v0.3.1 reliability fixture and write JSON evidence.")
     parser.add_argument("--project-registry-test", type=Path, help="Run disposable v0.4.0 Project Registry fixture and write JSON evidence.")
+    parser.add_argument("--project-registry-real-smoke", nargs=2, metavar=("LIBRARY_ROOT", "OUTPUT_JSON"), help="Run read-only Project Registry discovery against a real folder.")
+    parser.add_argument("--storage-intelligence-test", type=Path, help="Run disposable v0.4.x Storage Intelligence fixture and write JSON evidence.")
+    parser.add_argument("--storage-real-smoke", nargs=2, metavar=("LIBRARY_ROOT", "OUTPUT_JSON"), help="Run read-only Storage Intelligence smoke against a real project library.")
     parser.add_argument("--ui-responsiveness-test", type=Path, help="Run a disposable Tk responsiveness check and write JSON evidence.")
     parser.add_argument("--verify-persistence", nargs=2, metavar=("FIXTURE_ROOT", "OUTPUT_JSON"), help="Verify an existing self-test fixture from a separate process.")
     parser.add_argument("--verify-project-registry-persistence", nargs=2, metavar=("FIXTURE_ROOT", "OUTPUT_JSON"), help="Verify Project Registry state from a separate process.")
@@ -35,6 +41,17 @@ def main() -> None:
         return
     if args.project_registry_test:
         _write_cli_result(args.project_registry_test, lambda: run_project_registry_test(args.project_registry_test))
+        return
+    if args.project_registry_real_smoke:
+        output = Path(args.project_registry_real_smoke[1])
+        _write_cli_result(output, lambda: run_real_project_registry_smoke(Path(args.project_registry_real_smoke[0]), output))
+        return
+    if args.storage_intelligence_test:
+        _write_cli_result(args.storage_intelligence_test, lambda: run_storage_intelligence_test(args.storage_intelligence_test))
+        return
+    if args.storage_real_smoke:
+        output = Path(args.storage_real_smoke[1])
+        _write_cli_result(output, lambda: run_real_storage_smoke(Path(args.storage_real_smoke[0]), output))
         return
     if args.ui_responsiveness_test:
         run_ui_responsiveness_test(args.ui_responsiveness_test)

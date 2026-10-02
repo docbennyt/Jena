@@ -85,6 +85,7 @@ class ProjectLibrary:
     root_path: str
     display_name: str
     created_at: float
+    root_as_project: bool = False
 
     @classmethod
     def create(cls, root_path: Path, name: str | None = None) -> "ProjectLibrary":
@@ -267,6 +268,7 @@ def set_project_state(
     state: ProjectState,
     archive_manifest: Path | None = None,
     library_id: str = "",
+    root_as_project: bool = False,
 ) -> None:
     states = load_project_states(data_root)
     key = _canonical(project_path)
@@ -274,6 +276,8 @@ def set_project_state(
     entry["state"] = state.value
     if library_id:
         entry["library_id"] = library_id
+    if root_as_project:
+        entry["root_as_project"] = True
     entry["pinned"] = state in {ProjectState.ACTIVE, ProjectState.PAUSED, ProjectState.NEVER_ARCHIVE}
     entry["never_archive"] = state == ProjectState.NEVER_ARCHIVE
     if archive_manifest is not None:
@@ -294,9 +298,37 @@ def save_project_cache(data_root: Path, cache: dict[str, dict]) -> None:
     project_cache_path(data_root).write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
-def discover_project_library(library_root: Path, data_root: Path | None = None, library_id: str = "") -> list[ProjectRecord]:
+def invalidate_library_root_project_record(data_root: Path, library_root: Path) -> None:
+    """Remove stale automatic records that treated a project library as a project."""
+    key = _canonical(library_root.expanduser().resolve())
+    states = load_project_states(data_root)
+    state_entry = states.get(key)
+    changed = False
+    if state_entry and not state_entry.get("root_as_project"):
+        del states[key]
+        save_project_states(data_root, states)
+        changed = True
+    cache = load_project_cache(data_root)
+    cache_entry = cache.get(key)
+    if cache_entry and not cache_entry.get("root_as_project"):
+        del cache[key]
+        save_project_cache(data_root, cache)
+        changed = True
+    if changed:
+        data_root.mkdir(parents=True, exist_ok=True)
+
+
+def discover_project_library(
+    library_root: Path,
+    data_root: Path | None = None,
+    library_id: str = "",
+    root_as_project: bool = False,
+) -> list[ProjectRecord]:
     library_root = library_root.expanduser().resolve()
     library_id = library_id or stable_library_id(library_root)
+    library_key = _canonical(library_root)
+    if data_root and not root_as_project:
+        invalidate_library_root_project_record(data_root, library_root)
     states = load_project_states(data_root) if data_root else {}
     projects: list[ProjectRecord] = []
     for current, dirs, _files in os.walk(library_root, topdown=True, followlinks=False):
@@ -304,9 +336,10 @@ def discover_project_library(library_root: Path, data_root: Path | None = None, 
         if current_path.name in IGNORED_SCAN_DIRS and current_path != library_root:
             dirs[:] = []
             continue
-        if is_project_root(current_path):
+        is_library_root = _canonical(current_path) == library_key
+        if is_project_root(current_path) and (root_as_project or not is_library_root):
             projects.append(build_project_record(current_path, states.get(_canonical(current_path), {}), library_id=library_id))
-            dirs[:] = [name for name in dirs if name not in IGNORED_SCAN_DIRS]
+            dirs[:] = []
             continue
         dirs[:] = [name for name in dirs if name not in IGNORED_SCAN_DIRS]
     return sorted(projects, key=lambda item: item.size_bytes, reverse=True)
@@ -318,8 +351,10 @@ def quick_discover_project_roots(
     token: CancellationToken | None = None,
     on_project=None,
     on_progress=None,
+    root_as_project: bool = False,
 ) -> list[Path]:
     library_root = library_root.expanduser().resolve()
+    library_key = _canonical(library_root)
     found: list[Path] = []
     stack: list[tuple[Path, int]] = [(library_root, 0)]
     while stack:
@@ -335,7 +370,8 @@ def quick_discover_project_roots(
         except OSError:
             continue
         entry_names = {entry.name for entry in entries}
-        if _entry_names_indicate_project(entry_names, current):
+        is_library_root = _canonical(current) == library_key
+        if _entry_names_indicate_project(entry_names, current) and (root_as_project or not is_library_root):
             found.append(current)
             if on_project:
                 on_project(current)

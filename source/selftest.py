@@ -11,6 +11,7 @@ from pathlib import Path
 from core.compression import ArchiveFormat
 from core.downloads import categorize_downloads
 from core.file_actions import permanently_delete_paths, recycle_paths
+from core.models import Finding, RiskLevel
 from core.operations import recycle_findings
 from core.preview import PreviewService
 from core.project_library import (
@@ -27,6 +28,7 @@ from core.project_library import (
     verify_archive,
     verify_restored_project,
 )
+from core.workstation import build_storage_model, build_storage_opportunities, build_recovery_plan
 from core.tasks import TaskEvent, TaskManager, TaskState
 
 
@@ -185,7 +187,8 @@ def run_project_registry_test(output_path: Path, large_entries: int = 20000) -> 
             "library": str(documents),
             "detected": [path.name for path in roots_a],
             "records": [record.name for record in records_a],
-            "false_projects_absent": [path.name for path in roots_a] == ["HIT-ASA"],
+            "library_root_contains_git": (documents / ".git").exists(),
+            "false_projects_absent": [path.name for path in roots_a] == ["HIT-ASA"] and all(record.name != "Documents" for record in records_a),
         },
         "fixture_b_monorepo": {
             "detected": [path.name for path in roots_b],
@@ -238,6 +241,153 @@ def verify_project_registry_persistence(fixture_root: Path, output_path: Path) -
             record.name: state_display(record.state)
             for record in records
         }
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def run_real_project_registry_smoke(library_root: Path, output_path: Path) -> dict:
+    data = output_path.parent / "jena-real-project-registry-data"
+    library_root = library_root.expanduser().resolve()
+    roots = quick_discover_project_roots(library_root, max_depth=3)
+    root_names = [path.name for path in roots]
+    result = {
+        "library": str(library_root),
+        "library_root_name": library_root.name,
+        "library_root_returned": any(path.resolve() == library_root for path in roots),
+        "project_count": len(roots),
+        "project_names": root_names,
+        "projects": [str(path) for path in roots],
+        "dependency_false_positives": [
+            str(path)
+            for path in roots
+            if any(part in {"node_modules", ".venv", "venv", "site-packages", "vendor"} for part in path.parts)
+        ],
+        "data_root": str(data),
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def run_storage_intelligence_test(output_path: Path) -> dict:
+    root = output_path.parent / "jena-storage-intelligence-fixture"
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    data = root / "data"
+    library = root / "Projects"
+    active = _make_node_project_with_lock(library / "ActiveApp", dependency_bytes=1024, cache_bytes=256)
+    inactive = _make_node_project_with_lock(library / "OldPortfolio", dependency_bytes=4096, cache_bytes=1024)
+    protected = _make_node_project_with_lock(library / "Protected", dependency_bytes=2048, cache_bytes=256)
+
+    records = []
+    for path, state in [
+        (active, ProjectState.ACTIVE),
+        (inactive, ProjectState.INACTIVE),
+        (protected, ProjectState.NEVER_ARCHIVE),
+    ]:
+        set_project_state(data, path, state, library_id=stable_library_id(library))
+        records.append(analyze_and_cache_project(path, data, library_id=stable_library_id(library)))
+
+    findings = [
+        _fixture_finding(root / "Downloads" / "setup-old.exe", 700, ["old_download", "old_installer"], RiskLevel.LIKELY_DISPOSABLE),
+        _fixture_finding(root / "Downloads" / "setup-old.exe", 700, ["archive_file"], RiskLevel.LIKELY_DISPOSABLE),
+    ]
+    volume = None
+    model = build_storage_model(findings, records, 20 * 1024 * 1024 * 1024, volume_state=volume)
+    opportunities = build_storage_opportunities(model, records, findings)
+    plan = build_recovery_plan(opportunities, required_reclaim_bytes=5000, current_free_bytes=0)
+    result = {
+        "project_totals": {
+            "known_project_storage_bytes": model.known_project_storage_bytes,
+            "regenerable_project_storage_bytes": model.regenerable_project_storage_bytes,
+            "temporary_download_storage_bytes": model.temporary_download_storage_bytes,
+        },
+        "opportunities": [
+            {
+                "id": item.id,
+                "title": item.title,
+                "space": item.estimated_reclaim_bytes,
+                "risk": item.risk,
+                "confidence": item.confidence,
+                "blocked_by": item.blocked_by,
+                "recovery": item.recovery_path,
+            }
+            for item in opportunities
+        ],
+        "plan": {
+            "required_reclaim_bytes": plan.required_reclaim_bytes,
+            "expected_reclaim_bytes": plan.expected_reclaim_bytes,
+            "target_met": plan.target_met,
+            "steps": [step.opportunity.id for step in plan.steps],
+        },
+        "never_archive_blocked": any(
+            item.id == "archive-project-Protected" and item.blocked_by for item in opportunities
+        ),
+        "active_archive_blocked": any(
+            item.id == "archive-project-ActiveApp" and item.blocked_by for item in opportunities
+        ),
+        "no_double_count_download_bytes": model.temporary_download_storage_bytes == 700,
+        "fixture_root": str(root),
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def run_real_storage_smoke(library_root: Path, output_path: Path, target_free_gb: int = 20, max_projects: int = 5) -> dict:
+    data = output_path.parent / "jena-real-storage-data"
+    library_root = library_root.expanduser().resolve()
+    roots = quick_discover_project_roots(library_root, max_depth=3)
+    analysis_roots = roots[:max(1, max_projects)]
+    records = [
+        analyze_and_cache_project(path, data, library_id=stable_library_id(library_root))
+        for path in analysis_roots
+    ]
+    target_bytes = target_free_gb * 1024 * 1024 * 1024
+    model = build_storage_model([], records, target_bytes)
+    opportunities = build_storage_opportunities(model, records, [])
+    plan = build_recovery_plan(opportunities, model.gap_to_target_bytes, current_free_bytes=model.volume.free_bytes)
+    result = {
+        "library": str(library_root),
+        "library_root_returned": any(path.resolve() == library_root for path in roots),
+        "project_count": len(roots),
+        "analyzed_project_count": len(records),
+        "analysis_bounded": len(roots) > len(records),
+        "project_names": [record.name for record in records],
+        "discovered_project_names": [path.name for path in roots],
+        "volume": {
+            "path": model.volume.path,
+            "total_bytes": model.volume.total_bytes,
+            "free_bytes": model.volume.free_bytes,
+            "target_free_bytes": model.target_free_bytes,
+            "gap_to_target_bytes": model.gap_to_target_bytes,
+        },
+        "storage_totals": {
+            "known_project_storage_bytes": model.known_project_storage_bytes,
+            "regenerable_project_storage_bytes": model.regenerable_project_storage_bytes,
+        },
+        "top_opportunities": [
+            {
+                "title": item.title,
+                "space": item.estimated_reclaim_bytes,
+                "risk": item.risk,
+                "confidence": item.confidence,
+                "blocked_by": item.blocked_by,
+                "why": item.why,
+                "recovery": item.recovery_path,
+            }
+            for item in opportunities[:10]
+        ],
+        "plan": {
+            "expected_reclaim_bytes": plan.expected_reclaim_bytes,
+            "expected_free_bytes": plan.expected_free_bytes,
+            "target_met": plan.target_met,
+            "steps": [step.opportunity.title for step in plan.steps],
+        },
+        "data_root": str(data),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -315,6 +465,8 @@ def _registry_discovery_job(token, progress, library: Path, data: Path) -> dict:
 
 
 def _make_fixture_a(documents: Path) -> Path:
+    (documents / ".git").mkdir(parents=True)
+    _write(documents / "README.md", "Project Library root fixture; not a project.")
     (documents / "Study").mkdir(parents=True)
     (documents / "RandomFiles").mkdir()
     project = documents / "Projects" / "HIT-ASA"
@@ -361,6 +513,15 @@ def _make_node_project(project: Path, files: int) -> None:
     _write(project / "src" / "app.ts", "console.log('fixture')")
     for index in range(files):
         _write(project / "node_modules" / "pkg" / f"file-{index}.js", "x")
+
+
+def _make_node_project_with_lock(project: Path, dependency_bytes: int, cache_bytes: int) -> Path:
+    _write(project / "package.json", "{}")
+    _write(project / "package-lock.json", "{}")
+    _write(project / "src" / "app.ts", "console.log('fixture')")
+    _write(project / "node_modules" / "pkg" / "index.js", "d" * dependency_bytes)
+    _write(project / ".next" / "cache.bin", "c" * cache_bytes)
+    return project
 
 
 def _make_python_project(project: Path, files: int) -> None:
@@ -469,3 +630,26 @@ def _make_downloads(root: Path) -> None:
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _fixture_finding(path: Path, size: int, tags: list[str], risk: RiskLevel) -> Finding:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x" * size, encoding="utf-8")
+    return Finding(
+        id=str(path),
+        path=str(path),
+        name=path.name,
+        item_type="file",
+        size_bytes=size,
+        modified_at=path.stat().st_mtime,
+        category=tags[0],
+        reason="fixture",
+        recommended_action="fixture",
+        tags=tags,
+        reasons=["fixture"],
+        recommendations=["fixture"],
+        canonical_path=os.path.normcase(os.path.abspath(str(path))),
+        risk_level=risk,
+        recoverable_bytes=size if risk != RiskLevel.DO_NOT_TOUCH else 0,
+        source_scope="fixture",
+    )

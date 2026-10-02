@@ -1,2 +1,2 @@
 APP_NAME = "Jena"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"

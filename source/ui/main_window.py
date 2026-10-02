@@ -152,10 +152,10 @@ class StoragePilotApp:
         cards.pack(fill="x", padx=18, pady=18)
         self.metric_vars = {}
         for key, title in [
-            ("recoverable", "Potentially Recoverable"),
-            ("dev_cache", "Development Cache"),
-            ("duplicate", "Duplicate Space"),
-            ("findings", "Findings"),
+            ("recoverable", "Project Dependencies"),
+            ("dev_cache", "Old Downloads"),
+            ("duplicate", "Inactive Archive"),
+            ("findings", "Review Required"),
         ]:
             frame = ttk.LabelFrame(cards, text=title, padding=12)
             frame.pack(side="left", fill="x", expand=True, padx=5)
@@ -413,18 +413,23 @@ class StoragePilotApp:
             self.refresh_downloads()
 
     def refresh_dashboard(self) -> None:
-        metrics = self.db.dashboard_metrics()
         target_free_bytes = int(self.settings.get("target_free_gb")) * 1024 * 1024 * 1024
-        summary = build_workstation_summary(self.findings, target_free_bytes)
+        summary = build_workstation_summary(self.findings, target_free_bytes, projects=self.project_records)
         self.drive_var.set(f"C: drive · {format_bytes(summary.volume.free_bytes)} free of {format_bytes(summary.volume.total_bytes)}")
         if summary.target_met:
             self.target_var.set(f"Target reserve met: {format_bytes(summary.volume.target_free_bytes)} free.")
         else:
             self.target_var.set(f"Target reserve: {format_bytes(summary.volume.target_free_bytes)} · Gap: {format_bytes(summary.volume.free_gap_bytes)}")
-        self.metric_vars["recoverable"].set(format_bytes(metrics["recoverable"]))
-        self.metric_vars["dev_cache"].set(format_bytes(metrics["dev_cache"]))
-        self.metric_vars["duplicate"].set(format_bytes(metrics["duplicate"]))
-        self.metric_vars["findings"].set(str(metrics["finding_count"]))
+        model = summary.storage_model
+        inactive_archive = sum(
+            project.size_bytes
+            for project in self.project_records
+            if project.state == ProjectState.INACTIVE and not project.never_archive
+        )
+        self.metric_vars["recoverable"].set(format_bytes(model.regenerable_project_storage_bytes if model else 0))
+        self.metric_vars["dev_cache"].set(format_bytes(model.temporary_download_storage_bytes if model else 0))
+        self.metric_vars["duplicate"].set(format_bytes(inactive_archive))
+        self.metric_vars["findings"].set(format_bytes(model.review_required_storage_bytes if model else 0))
         self.opportunity_table.delete(*self.opportunity_table.get_children())
         for opportunity in summary.opportunities[:6]:
             self.opportunity_table.insert("", "end", text=opportunity.title, values=(
@@ -443,7 +448,7 @@ class StoragePilotApp:
 
     def build_recovery_plan(self) -> None:
         target_free_bytes = int(self.settings.get("target_free_gb")) * 1024 * 1024 * 1024
-        summary = build_workstation_summary(self.findings, target_free_bytes)
+        summary = build_workstation_summary(self.findings, target_free_bytes, projects=self.project_records)
         if not summary.opportunities:
             show_info(self.root, "Recovery plan", "Scan Downloads, Storage, or your Project Library first so Jena can build a realistic plan.")
             return
@@ -453,13 +458,15 @@ class StoragePilotApp:
             "",
         ]
         expected = summary.volume.free_bytes
-        for opportunity in summary.opportunities:
-            if expected >= summary.volume.target_free_bytes:
-                break
-            expected += opportunity.space_gain_bytes
-            lines.append(f"{opportunity.title} -> +{format_bytes(opportunity.space_gain_bytes)}")
+        plan_steps = summary.recovery_plan.steps if summary.recovery_plan else []
+        for step in plan_steps:
+            opportunity = step.opportunity
+            expected = summary.volume.free_bytes + step.cumulative_reclaim_bytes
+            lines.append(f"{opportunity.title} -> +{format_bytes(opportunity.space_gain_bytes)} · {opportunity.risk} · {opportunity.recovery_path}")
         lines.append("")
         lines.append(f"Expected result: {format_bytes(expected)} free.")
+        if summary.recovery_plan and not summary.recovery_plan.target_met:
+            lines.append(f"Still short by {format_bytes(max(0, remaining - summary.recovery_plan.expected_reclaim_bytes))}.")
         lines.append("Nothing has been changed. Approve actions from Downloads, Projects, or Storage.")
         show_info(self.root, "Recovery plan", "\n".join(lines))
 
@@ -989,6 +996,7 @@ class StoragePilotApp:
             self.status.set("Project work failed")
             show_error(self.root, "Project work failed", event.error)
         self.refresh_projects()
+        self.refresh_dashboard()
         self.status.set(f"Project Library refreshed · {len(self.project_records)} project(s)")
 
     def refresh_projects(self) -> None:

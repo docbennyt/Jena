@@ -210,6 +210,8 @@ def test_quick_discovery_skips_dependency_projects_and_broad_non_projects(tmp_pa
 
 def test_fixture_a_documents_library_does_not_become_project_and_prunes_dependencies(tmp_path: Path):
     documents = tmp_path / "Documents"
+    (documents / ".git").mkdir(parents=True)
+    (documents / "README.md").write_text("library root, not a project")
     (documents / "Study").mkdir(parents=True)
     (documents / "RandomFiles").mkdir()
     hit_asa = documents / "Projects" / "HIT-ASA"
@@ -231,6 +233,45 @@ def test_fixture_a_documents_library_does_not_become_project_and_prunes_dependen
     assert documents / "RandomFiles" not in roots
     assert hit_asa / "node_modules" / "uuid" not in roots
     assert hit_asa / "node_modules" / "react" not in roots
+
+
+def test_library_root_marker_is_excluded_unless_explicitly_requested(tmp_path: Path):
+    documents = tmp_path / "Documents"
+    (documents / ".git").mkdir(parents=True)
+    (documents / "README.md").write_text("root marker")
+    hit_asa = documents / "Projects" / "HIT-ASA"
+    jena = documents / "Projects" / "Jena"
+    (hit_asa / ".git").mkdir(parents=True)
+    (hit_asa / "package.json").write_text("{}")
+    (hit_asa / "src").mkdir()
+    (jena / ".git").mkdir(parents=True)
+    (jena / "pyproject.toml").write_text("[project]\nname='jena'\n")
+
+    roots = quick_discover_project_roots(documents, max_depth=3)
+    records = discover_project_library(documents, tmp_path / "data")
+    explicit_roots = quick_discover_project_roots(documents, max_depth=3, root_as_project=True)
+    explicit_records = discover_project_library(documents, tmp_path / "data-explicit", root_as_project=True)
+
+    assert roots == [hit_asa, jena]
+    assert sorted(Path(record.path) for record in records) == sorted([hit_asa, jena])
+    assert documents not in roots
+    assert explicit_roots == [documents]
+    assert [Path(record.path) for record in explicit_records] == [documents]
+
+
+def test_migration_removes_historical_library_root_project_without_touching_children(tmp_path: Path):
+    documents = tmp_path / "Documents"
+    (documents / ".git").mkdir(parents=True)
+    child = make_project(documents / "Projects", "HIT-ASA")
+    data = tmp_path / "data"
+    library_id = stable_library_id(documents)
+
+    set_project_state(data, documents, ProjectState.ACTIVE, library_id=library_id)
+    set_project_state(data, child, ProjectState.NEVER_ARCHIVE, library_id=library_id)
+    records = discover_project_library(documents, data, library_id=library_id)
+
+    assert [Path(record.path) for record in records] == [child]
+    assert records[0].state == ProjectState.NEVER_ARCHIVE
 
 
 def test_quick_discovery_treats_monorepo_as_primary_project(tmp_path: Path):
