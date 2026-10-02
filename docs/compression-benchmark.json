@@ -1,0 +1,126 @@
+{
+  "generated_at": "2026-10-02T18:01:43+0200",
+  "engine": "7-Zip 26.03 (x64)",
+  "profile": "balanced (-mx=5, multithreaded)",
+  "fixtures": [
+    {
+      "fixture": "jena-python",
+      "format": "zip",
+      "files": 58,
+      "input_bytes": 518914,
+      "archive_bytes": 198997,
+      "ratio": 0.3835,
+      "elapsed_seconds_median": 0.1081,
+      "runs_seconds": [
+        0.5696,
+        0.1039,
+        0.1081
+      ],
+      "throughput_mib_per_second": 4.58
+    },
+    {
+      "fixture": "jena-python",
+      "format": "7z",
+      "files": 58,
+      "input_bytes": 518914,
+      "archive_bytes": 134148,
+      "ratio": 0.2585,
+      "elapsed_seconds_median": 0.1575,
+      "runs_seconds": [
+        0.1432,
+        0.1659,
+        0.1575
+      ],
+      "throughput_mib_per_second": 3.14
+    },
+    {
+      "fixture": "typescript-monorepo",
+      "format": "zip",
+      "files": 1202,
+      "input_bytes": 5609444,
+      "archive_bytes": 323627,
+      "ratio": 0.0577,
+      "elapsed_seconds_median": 0.4378,
+      "runs_seconds": [
+        18.7584,
+        0.4201,
+        0.4378
+      ],
+      "throughput_mib_per_second": 12.22
+    },
+    {
+      "fixture": "typescript-monorepo",
+      "format": "7z",
+      "files": 1202,
+      "input_bytes": 5609444,
+      "archive_bytes": 14564,
+      "ratio": 0.0026,
+      "elapsed_seconds_median": 0.4798,
+      "runs_seconds": [
+        0.5064,
+        0.4798,
+        0.4501
+      ],
+      "throughput_mib_per_second": 11.15
+    },
+    {
+      "fixture": "mixed-source-assets",
+      "format": "zip",
+      "files": 513,
+      "input_bytes": 7673456,
+      "archive_bytes": 6414508,
+      "ratio": 0.8359,
+      "elapsed_seconds_median": 0.288,
+      "runs_seconds": [
+        3.3501,
+        0.288,
+        0.2721
+      ],
+      "throughput_mib_per_second": 25.41
+    },
+    {
+      "fixture": "mixed-source-assets",
+      "format": "7z",
+      "files": 513,
+      "input_bytes": 7673456,
+      "archive_bytes": 6298319,
+      "ratio": 0.8208,
+      "elapsed_seconds_median": 0.8797,
+      "runs_seconds": [
+        0.8797,
+        0.9029,
+        0.8406
+      ],
+      "throughput_mib_per_second": 8.32
+    }
+  ],
+  "summary": {
+    "zip": {
+      "input_bytes": 13801814,
+      "archive_bytes": 6937132,
+      "weighted_ratio": 0.5026,
+      "elapsed_seconds": 0.8339,
+      "throughput_mib_per_second": 15.78
+    },
+    "7z": {
+      "input_bytes": 13801814,
+      "archive_bytes": 6447031,
+      "weighted_ratio": 0.4671,
+      "elapsed_seconds": 1.517,
+      "throughput_mib_per_second": 8.68
+    },
+    "comparison": {
+      "seven_zip_space_saving_vs_zip_percent": 7.06,
+      "seven_zip_time_multiple_vs_zip": 1.82,
+      "native_windows_recovery": {
+        "zip": true,
+        "7z": false
+      }
+    }
+  },
+  "decision": {
+    "default_format": "zip",
+    "compact_option": "7z",
+    "reason": "ZIP is the recovery-first default because Windows can open it without Jena or 7-Zip. 7z remains the compact option when the measured space saving matters more than native recovery compatibility."
+  }
+}

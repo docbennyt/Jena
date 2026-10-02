@@ -1,0 +1,56 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Private workstation data and runtime state
+data/
+logs/
+exports/
+work/
+_REVIEW_BEFORE_DELETE/
+*_scan_report*
+*scan-report*
+*user-inventory*
+*inventory*
+project-analysis-cache.json
+project-library.json
+settings.json
+
+# Build and packaged output
+build/
+dist/
+*.spec.bak
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python cache and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary preview/cache files
+*.tmp
+*.temp
+*.bak
+*.cache
+preview-cache/
